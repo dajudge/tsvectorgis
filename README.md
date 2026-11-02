@@ -31,7 +31,7 @@ The Python client reads `DATABASE_URL` (default: `postgresql://bench:bench@local
 1. The 20 most similar compressor-failure fingerprints within 20 km of Munich, in the last two hours of generated data.
 2. Fault-like records around Munich, aggregated into 15-minute time buckets.
 
-Output: `results/summary.md`, `results/benchmark.json` and two query plans.
+Output: `results/summary.md`, `results/benchmark.json` and three query plans (approximate neighbors, exact neighbors, hotspots). Filtered HNSW searching uses iterative scans, and the benchmark verifies result count and reports recall@20 against an exact baseline. Check the plans to confirm when PostgreSQL chooses HNSW.
 
 ## GitHub Actions
 
