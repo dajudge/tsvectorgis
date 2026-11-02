@@ -35,6 +35,26 @@ ORDER BY signature <=> %s::vector
 LIMIT 20
 """
 
+# This materialized CTE first applies the time/geographic predicates, then ranks
+# every matching row exactly; no approximate HNSW index can affect this baseline.
+EXACT_NEIGHBORS_SQL = """
+WITH candidates AS MATERIALIZED (
+    SELECT truck_id, ts, position, vibration, signature
+    FROM fleet_telemetry
+    WHERE ts >= %s AND ts <= %s
+      AND ST_DWithin(
+          position,
+          ST_SetSRID(ST_MakePoint(11.58, 48.14), 4326)::geography,
+          20000
+      )
+)
+SELECT truck_id, ts, ST_AsText(position::geometry), vibration,
+       signature <=> %s::vector AS similarity_distance
+FROM candidates
+ORDER BY similarity_distance, truck_id, ts
+LIMIT 20
+"""
+
 HOTSPOTS_SQL = """
 SELECT time_bucket('15 minutes', ts) AS bucket,
        count(*) AS observations,
@@ -111,7 +131,7 @@ def run_query(conn, name, sql, params, iterations, results_dir):
         "rows_returned": row_count,
         "p50_ms": round(statistics.median(durations), 2),
         "p95_ms": round(durations[math.ceil(0.95 * len(durations)) - 1], 2),
-    }
+    }, records
 
 
 def main():
@@ -160,15 +180,42 @@ def main():
                 cur.execute("SELECT pg_database_size(current_database())")
                 database_bytes = cur.fetchone()[0]
 
+            # Post-filtering can discard HNSW candidates. Let pgvector keep
+            # scanning until it finds enough points inside the time/geofence.
+            with conn.cursor() as cur:
+                cur.execute("SET hnsw.iterative_scan = strict_order")
+                cur.execute("SET hnsw.ef_search = 100")
+                cur.execute("SET hnsw.max_scan_tuples = 100000")
+
+            neighbors, approximate_rows = run_query(
+                conn, "neighbors", NEIGHBORS_SQL,
+                (fingerprint, begin, end, fingerprint), args.iterations, args.output
+            )
+            exact, exact_rows = run_query(
+                conn, "neighbors-exact", EXACT_NEIGHBORS_SQL,
+                (begin, end, fingerprint), args.iterations, args.output
+            )
+            # truck_id + timestamp uniquely identifies a generated sample.
+            approx_ids = {(r[0], r[1]) for r in approximate_rows}
+            exact_ids = {(r[0], r[1]) for r in exact_rows}
+            recall = len(approx_ids & exact_ids) / len(exact_ids) if exact_ids else 1.0
+            neighbors["recall_at_20"] = round(recall, 4)
+            neighbors["expected_rows"] = len(exact_rows)
+            if len(approximate_rows) != len(exact_rows):
+                raise RuntimeError(
+                    f"Filtered neighbor query returned {len(approximate_rows)} rows; "
+                    f"exact search returned {len(exact_rows)}. "
+                    "Inspect neighbors-explain.txt and HNSW scan limits."
+                )
+
+            hotspots, _ = run_query(
+                conn, "hotspots", HOTSPOTS_SQL,
+                (fingerprint, begin, end), args.iterations, args.output
+            )
             queries = {
-                "neighbors": run_query(
-                    conn, "neighbors", NEIGHBORS_SQL,
-                    (fingerprint, begin, end, fingerprint), args.iterations, args.output
-                ),
-                "hotspots": run_query(
-                    conn, "hotspots", HOTSPOTS_SQL,
-                    (fingerprint, begin, end), args.iterations, args.output
-                ),
+                "neighbors": neighbors,
+                "neighbors_exact": exact,
+                "hotspots": hotspots,
             }
 
     result = {
@@ -198,7 +245,14 @@ def main():
             f"| {name} p95 | {outcome['p95_ms']:.2f} ms |",
             f"| {name} result rows | {outcome['rows_returned']} |",
         ]
-    summary += ["", "COPY measures loading a pre-generated CSV. Query timing is sequential, not concurrent with ingestion. HNSW results are approximate."]
+    summary += [
+        f"| neighbors recall@20 vs exact | {neighbors['recall_at_20']:.1%} |",
+        f"| neighbors expected rows | {neighbors['expected_rows']} |",
+        "",
+        "COPY measures loading a pre-generated CSV. Queries run sequentially, not concurrently with ingestion. "
+        "HNSW is approximate; the exact baseline uses a materialized, filtered candidate set. "
+        "Check EXPLAIN plans to see whether PostgreSQL actually chose the HNSW index."
+    ]
     content = "\n".join(summary) + "\n"
     (args.output / "summary.md").write_text(content)
     print(content)
