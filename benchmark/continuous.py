@@ -230,6 +230,8 @@ def run_benchmark(args, dsn):
         },
         "ingest": {
             "rows": inserted,
+            "copy_batch_count": len(writer_result["batches_ms"]),
+            "avg_rows_per_batch": round(inserted / len(writer_result["batches_ms"]), 1),
             "elapsed_s": round(elapsed, 3),
             "rows_s": round(inserted / elapsed, 2),
             "target_achievement_pct": round(100 * inserted / (elapsed * args.ingest_rate), 1),
@@ -254,6 +256,8 @@ def summary_md(result):
         f"| Inserted | {ingest['rows']:,} rows |",
         f"| Actual ingest rate | {ingest['rows_s']:,.0f} rows/s |",
         f"| Target achieved | {ingest['target_achievement_pct']}% |",
+        f"| COPY batches | {ingest['copy_batch_count']} |",
+        f"| Average rows/COPY | {ingest['avg_rows_per_batch']} |",
         f"| COPY batch p95 | {ingest['copy_batches']['p95_ms']} ms |",
     ]
     for name, latency in result["queries"].items():
