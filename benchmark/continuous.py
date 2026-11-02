@@ -46,6 +46,16 @@ def make_batch(first, count, rate, anchor, trucks, seed):
     return buffer.getvalue().encode("utf-8")
 
 
+def prepare_batches(rows, batch_size, rate, anchor, trucks, seed):
+    """Build the exact COPY payloads before starting the measured load."""
+    started = time.perf_counter()
+    batches = [
+        make_batch(i, min(batch_size, rows - i), rate, anchor, trucks, seed)
+        for i in range(0, rows, batch_size)
+    ]
+    return batches, time.perf_counter() - started
+
+
 def distribution(values):
     if not values:
         return {"count": 0, "p50_ms": None, "p95_ms": None, "max_ms": None}
@@ -86,6 +96,15 @@ def run_benchmark(args, dsn):
         ),
     }
 
+    # Materialize payloads before starting writer and readers. COPY timings and
+    # achieved insert rates therefore exclude Python telemetry generation.
+    target_rows = args.duration * args.ingest_rate
+    batches, generation_seconds = prepare_batches(
+        target_rows, args.batch_size, args.ingest_rate,
+        anchor, args.trucks, args.seed,
+    )
+    generated_bytes = sum(len(payload) for payload in batches)
+
     ready = threading.Barrier(args.query_workers + 2)  # writer, readers, main
     go = threading.Event()
     stop = threading.Event()
@@ -125,7 +144,10 @@ def run_benchmark(args, dsn):
                     amount = min(batch_target, available)
                     if amount <= 0:
                         break
-                    payload = make_batch(sent, amount, args.ingest_rate, anchor, args.trucks, args.seed)
+                    payload = batches[sent // args.batch_size]
+                    if amount < batch_target:
+                        # At the deadline, flush at most one partial batch.
+                        payload = b"".join(payload.splitlines(keepends=True)[:amount])
                     batch_start = time.monotonic()
                     with conn.cursor() as cursor:
                         with cursor.copy(COPY_SQL) as copy:
@@ -239,6 +261,8 @@ def run_benchmark(args, dsn):
             "batch_size": args.batch_size, "query_workers": args.query_workers,
             "query_interval_ms": args.query_interval_ms, "trucks": args.trucks,
             "seed": args.seed,
+            "generation_seconds": round(generation_seconds, 3),
+            "generated_bytes": generated_bytes,
         },
         "ingest": {
             "rows": inserted,
@@ -266,6 +290,7 @@ def summary_md(result):
         f"{config['duration_s']}s, {config['query_workers']} query workers",
         "",
         "| Metric | Result |", "|---|---:|",
+        f"| Payload preparation (outside load) | {config.get('generation_seconds', 0):.2f} s |",
         f"| Inserted | {ingest['rows']:,} rows |",
         f"| Actual ingest rate | {ingest['rows_s']:,.0f} rows/s |",
         f"| Target achieved | {ingest['target_achievement_pct']}% |",
@@ -284,7 +309,8 @@ def summary_md(result):
         "",
         "Each query worker alternates similarity search and time-bucketed hotspot aggregation, "
         "both spatially and temporally filtered. Runs are sequential, not hardware-isolated; "
-        "the two phases have slightly different database sizes.",
+        "the two phases have slightly different database sizes. "
+        "Synthetic rows are generated before the measured ingestion window.",
         "",
     ])
     return "\n".join(lines)
