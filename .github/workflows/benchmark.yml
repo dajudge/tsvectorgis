@@ -67,6 +67,10 @@ jobs:
           python benchmark/continuous.py --duration "$DURATION" --ingest-rate "$INGEST_RATE" --query-workers "$QUERY_WORKERS" --output results/concurrent
           cat results/ingest-only/summary.md >> "$GITHUB_STEP_SUMMARY"
           cat results/concurrent/summary.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Comparison smoke test and charts
+        run: |
+          python benchmark/compare.py --rates 500 --workers 2 --strategies auto,spatial,hnsw --duration 4 --output results/comparison
+          cat results/comparison/summary.md >> "$GITHUB_STEP_SUMMARY"
       - name: Database logs on failure
         if: failure()
         run: docker compose logs --no-color > postgres.log || true

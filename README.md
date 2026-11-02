@@ -50,3 +50,19 @@ These are exploratory tests on shared CI runners, **not precise hardware compari
 The custom image starts from `timescale/timescaledb:2.31.0-pg18`. pgvector is bundled upstream; PostGIS is added from Alpine packages and its extension files installed into the image's PostgreSQL paths. The database initialization creates the three extensions and a hypertable.
 
 PostGIS's Alpine package is compiled against PostgreSQL 18, so the PostgreSQL major version is intentionally pinned to 18.
+
+## Scale comparisons and charts
+
+`benchmark/compare.py` runs a matrix of paced inserts against the same database, varying:
+- Seed size: 1M and 5M records.
+- Target ingestion: 1,000 and 5,000 rows/second.
+- Concurrent query workers: 0 (baseline), 2, 4 and 8.
+- Vector search: `auto` (PostgreSQL planner), `spatial` (exact ranking after geographic/time filtering), and `hnsw` (vector index preferred via planner settings).
+
+```bash
+python benchmark/compare.py --rates 1000,5000 --workers 2,4,8 --duration 8 --output results/comparison
+```
+
+The scale workflow runs **1M and 5M** on the feature branch; afterwards its manual dispatch controls allow selecting either size and test duration. Outputs include `comparison.json`, `comparison.csv`, Markdown and three PNG plots (throughput, vector p95 and hotspot p95).
+
+**Limitations:** CI is shared infrastructure. Each scenario writes new records, so later scenarios see a larger database and may see different cache/index conditions. The comparison is exploratory, not statistically controlled. Forced HNSW measures an alternative access path, not necessarily PostgreSQL's best plan.

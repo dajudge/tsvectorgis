@@ -15,7 +15,7 @@ from datetime import timedelta
 
 import psycopg
 
-from run import COPY_SQL, HOTSPOTS_SQL, MUNICH_LAT, MUNICH_LON, NEIGHBORS_SQL
+from run import COPY_SQL, EXACT_NEIGHBORS_SQL, HOTSPOTS_SQL, MUNICH_LAT, MUNICH_LON, NEIGHBORS_SQL
 
 
 def make_batch(first, count, rate, anchor, trucks, seed):
@@ -44,6 +44,16 @@ def make_batch(first, count, rate, anchor, trucks, seed):
             "[" + ",".join(f"{x:.5f}" for x in signature) + "]",
         ])
     return buffer.getvalue().encode("utf-8")
+
+
+def prepare_batches(rows, batch_size, rate, anchor, trucks, seed):
+    """Build the exact COPY payloads before starting the measured load."""
+    started = time.perf_counter()
+    batches = [
+        make_batch(i, min(batch_size, rows - i), rate, anchor, trucks, seed)
+        for i in range(0, rows, batch_size)
+    ]
+    return batches, time.perf_counter() - started
 
 
 def distribution(values):
@@ -75,16 +85,25 @@ def run_benchmark(args, dsn):
     # A fixed window covers both the initial seed and rows arriving during this run.
     begin = anchor - timedelta(hours=2)
     end = anchor + timedelta(seconds=args.duration + 60)
+    strategy = getattr(args, "search_strategy", "auto")
+    neighbor_sql = EXACT_NEIGHBORS_SQL if strategy == "spatial" else NEIGHBORS_SQL
+    neighbor_params = (begin, end, fingerprint) if strategy == "spatial" else (fingerprint, begin, end, fingerprint)
     queries = {
-        "neighbors": (
-            NEIGHBORS_SQL,
-            (fingerprint, begin, end, fingerprint),
-        ),
+        "neighbors": (neighbor_sql, neighbor_params),
         "hotspots": (
             HOTSPOTS_SQL,
             (fingerprint, begin, end),
         ),
     }
+
+    # Materialize payloads before starting writer and readers. COPY timings and
+    # achieved insert rates therefore exclude Python telemetry generation.
+    target_rows = args.duration * args.ingest_rate
+    batches, generation_seconds = prepare_batches(
+        target_rows, args.batch_size, args.ingest_rate,
+        anchor, args.trucks, args.seed,
+    )
+    generated_bytes = sum(len(payload) for payload in batches)
 
     ready = threading.Barrier(args.query_workers + 2)  # writer, readers, main
     go = threading.Event()
@@ -125,7 +144,10 @@ def run_benchmark(args, dsn):
                     amount = min(batch_target, available)
                     if amount <= 0:
                         break
-                    payload = make_batch(sent, amount, args.ingest_rate, anchor, args.trucks, args.seed)
+                    payload = batches[sent // args.batch_size]
+                    if amount < batch_target:
+                        # At the deadline, flush at most one partial batch.
+                        payload = b"".join(payload.splitlines(keepends=True)[:amount])
                     batch_start = time.monotonic()
                     with conn.cursor() as cursor:
                         with cursor.copy(COPY_SQL) as copy:
@@ -164,13 +186,24 @@ def run_benchmark(args, dsn):
                         continue
                     name = "neighbors" if sequence % 2 == 0 else "hotspots"
                     sql, params = queries[name]
-                    query_start = time.monotonic()
+                    forced = name == "neighbors" and strategy == "hnsw"
                     with conn.cursor() as cursor:
-                        cursor.execute(sql, params)
-                        cursor.fetchall()
-                    reader_results[worker_id][name].append(
-                        (time.monotonic() - query_start) * 1000
-                    )
+                        if forced:
+                            cursor.execute("SET enable_seqscan = off")
+                            cursor.execute("SET enable_bitmapscan = off")
+                            cursor.execute("SET enable_sort = off")
+                        try:
+                            query_start = time.monotonic()
+                            cursor.execute(sql, params)
+                            cursor.fetchall()
+                            reader_results[worker_id][name].append(
+                                (time.monotonic() - query_start) * 1000
+                            )
+                        finally:
+                            if forced:
+                                cursor.execute("RESET enable_sort")
+                                cursor.execute("RESET enable_bitmapscan")
+                                cursor.execute("RESET enable_seqscan")
                     sequence += 1
                     next_due = max(next_due + args.query_interval_ms / 1000, time.monotonic())
         except Exception as error:
@@ -224,9 +257,12 @@ def run_benchmark(args, dsn):
     return {
         "config": {
             "duration_s": args.duration, "ingest_target_rows_s": args.ingest_rate,
+            "search_strategy": strategy,
             "batch_size": args.batch_size, "query_workers": args.query_workers,
             "query_interval_ms": args.query_interval_ms, "trucks": args.trucks,
             "seed": args.seed,
+            "generation_seconds": round(generation_seconds, 3),
+            "generated_bytes": generated_bytes,
         },
         "ingest": {
             "rows": inserted,
@@ -249,10 +285,12 @@ def summary_md(result):
     ingest = result["ingest"]
     lines = [
         f"## Continuous load ({config['query_workers']} query workers)", "",
+        f"**Search strategy:** {config.get('search_strategy', 'auto')}",
         f"**Target:** {config['ingest_target_rows_s']:,} rows/s for "
         f"{config['duration_s']}s, {config['query_workers']} query workers",
         "",
         "| Metric | Result |", "|---|---:|",
+        f"| Payload preparation (outside load) | {config.get('generation_seconds', 0):.2f} s |",
         f"| Inserted | {ingest['rows']:,} rows |",
         f"| Actual ingest rate | {ingest['rows_s']:,.0f} rows/s |",
         f"| Target achieved | {ingest['target_achievement_pct']}% |",
@@ -271,7 +309,8 @@ def summary_md(result):
         "",
         "Each query worker alternates similarity search and time-bucketed hotspot aggregation, "
         "both spatially and temporally filtered. Runs are sequential, not hardware-isolated; "
-        "the two phases have slightly different database sizes.",
+        "the two phases have slightly different database sizes. "
+        "Synthetic rows are generated before the measured ingestion window.",
         "",
     ])
     return "\n".join(lines)
@@ -283,6 +322,7 @@ def main():
     parser.add_argument("--ingest-rate", type=int, default=500, help="Target COPY rows/second")
     parser.add_argument("--batch-size", type=int, default=100)
     parser.add_argument("--query-workers", type=int, default=2)
+    parser.add_argument("--search-strategy", choices=("auto", "spatial", "hnsw"), default="auto")
     parser.add_argument("--query-interval-ms", type=int, default=500)
     parser.add_argument("--statement-timeout-ms", type=int, default=10000)
     parser.add_argument("--trucks", type=int, default=1000)

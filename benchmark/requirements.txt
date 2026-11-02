@@ -1,1 +1,2 @@
 psycopg[binary]>=3.2,<4
+matplotlib>=3.8,<4
