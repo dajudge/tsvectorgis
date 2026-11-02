@@ -1,6 +1,9 @@
 services:
   db:
     build: .
+    # PostgreSQL parallel queries use dynamic shared-memory segments.
+    # Docker's default 64 MiB /dev/shm fails at 5M rows with 8 readers.
+    shm_size: 1gb
     environment:
       POSTGRES_DB: bench
       POSTGRES_USER: bench
