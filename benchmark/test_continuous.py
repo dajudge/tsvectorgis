@@ -5,7 +5,7 @@ import json
 import unittest
 from datetime import datetime, timezone
 
-from continuous import distribution, make_batch, summary_md
+from continuous import distribution, make_batch, prepare_batches, summary_md
 
 
 class ContinuousBenchmarkTest(unittest.TestCase):
@@ -23,6 +23,15 @@ class ContinuousBenchmarkTest(unittest.TestCase):
         self.assertEqual(len(json.loads(parsed[0][-1])), 64)
         self.assertTrue(parsed[0][2].startswith("SRID=4326;POINT("))
         self.assertLess(parsed[0][0], parsed[1][0])
+
+    def test_prepared_batches_are_identical_to_direct_generator(self):
+        anchor = datetime(2026, 11, 2, tzinfo=timezone.utc)
+        prepared, generation_seconds = prepare_batches(11, 4, 100, anchor, 1000, 42)
+        expected = make_batch(0, 11, 100, anchor, 1000, 42)
+        self.assertEqual(len(prepared), 3)
+        self.assertEqual(b"".join(prepared), expected)
+        self.assertEqual([len(list(csv.reader(io.StringIO(b.decode("utf-8"))))) for b in prepared], [4, 4, 3])
+        self.assertGreaterEqual(generation_seconds, 0)
 
     def test_distribution(self):
         self.assertEqual(distribution([])["count"], 0)
