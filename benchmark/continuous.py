@@ -105,20 +105,26 @@ def run_benchmark(args, dsn):
                 start = started[0]
                 deadline = start + args.duration
                 sent = 0
-                while not stop.is_set():
+                target_rows = args.duration * args.ingest_rate
+                while not stop.is_set() and sent < target_rows:
                     now = time.monotonic()
-                    if now >= deadline:
-                        break
-                    # Only emit rows whose scheduled send time has passed.
+                    closing = now >= deadline
                     due = min(
                         math.floor((now - start) * args.ingest_rate),
-                        args.duration * args.ingest_rate,
+                        target_rows,
                     )
+                    # Wait for an entire batch to become due. At the deadline,
+                    # send at most one final partial batch rather than draining a
+                    # backlog and hiding that the target rate was unsustainable.
+                    batch_target = min(args.batch_size, target_rows - sent)
                     available = due - sent
-                    if available <= 0:
-                        time.sleep(min(0.02, max(0.001, (sent + 1) / args.ingest_rate - (now - start))))
+                    if not closing and available < batch_target:
+                        wait_until = start + (sent + batch_target) / args.ingest_rate
+                        time.sleep(min(0.02, max(0.001, wait_until - now)))
                         continue
-                    amount = min(args.batch_size, available)
+                    amount = min(batch_target, available)
+                    if amount <= 0:
+                        break
                     payload = make_batch(sent, amount, args.ingest_rate, anchor, args.trucks, args.seed)
                     batch_start = time.monotonic()
                     with conn.cursor() as cursor:
@@ -127,6 +133,8 @@ def run_benchmark(args, dsn):
                     writer_result["batches_ms"].append((time.monotonic() - batch_start) * 1000)
                     sent += amount
                     writer_result["rows"] = sent
+                    if closing:
+                        break
                 writer_result["finished_at"] = time.monotonic()
         except Exception as error:
             errors.append(f"writer: {type(error).__name__}: {error}")
