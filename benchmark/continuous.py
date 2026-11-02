@@ -164,13 +164,24 @@ def run_benchmark(args, dsn):
                         continue
                     name = "neighbors" if sequence % 2 == 0 else "hotspots"
                     sql, params = queries[name]
-                    query_start = time.monotonic()
+                    forced = name == "neighbors" and strategy == "hnsw"
                     with conn.cursor() as cursor:
-                        cursor.execute(sql, params)
-                        cursor.fetchall()
-                    reader_results[worker_id][name].append(
-                        (time.monotonic() - query_start) * 1000
-                    )
+                        if forced:
+                            cursor.execute("SET enable_seqscan = off")
+                            cursor.execute("SET enable_bitmapscan = off")
+                            cursor.execute("SET enable_sort = off")
+                        try:
+                            query_start = time.monotonic()
+                            cursor.execute(sql, params)
+                            cursor.fetchall()
+                            reader_results[worker_id][name].append(
+                                (time.monotonic() - query_start) * 1000
+                            )
+                        finally:
+                            if forced:
+                                cursor.execute("RESET enable_sort")
+                                cursor.execute("RESET enable_bitmapscan")
+                                cursor.execute("RESET enable_seqscan")
                     sequence += 1
                     next_due = max(next_due + args.query_interval_ms / 1000, time.monotonic())
         except Exception as error:
