@@ -131,7 +131,7 @@ def run_query(conn, name, sql, params, iterations, results_dir):
         "rows_returned": row_count,
         "p50_ms": round(statistics.median(durations), 2),
         "p95_ms": round(durations[math.ceil(0.95 * len(durations)) - 1], 2),
-    }, records
+    }, records, plan
 
 
 def main():
@@ -187,33 +187,62 @@ def main():
                 cur.execute("SET hnsw.ef_search = 100")
                 cur.execute("SET hnsw.max_scan_tuples = 100000")
 
-            neighbors, approximate_rows = run_query(
+            neighbors, approximate_rows, neighbors_plan = run_query(
                 conn, "neighbors", NEIGHBORS_SQL,
                 (fingerprint, begin, end, fingerprint), args.iterations, args.output
             )
-            exact, exact_rows = run_query(
+            exact, exact_rows, _ = run_query(
                 conn, "neighbors-exact", EXACT_NEIGHBORS_SQL,
                 (begin, end, fingerprint), args.iterations, args.output
             )
-            # truck_id + timestamp uniquely identifies a generated sample.
-            approx_ids = {(r[0], r[1]) for r in approximate_rows}
-            exact_ids = {(r[0], r[1]) for r in exact_rows}
-            recall = len(approx_ids & exact_ids) / len(exact_ids) if exact_ids else 1.0
-            neighbors["recall_at_20"] = round(recall, 4)
-            neighbors["expected_rows"] = len(exact_rows)
-            if len(approximate_rows) != len(exact_rows):
-                raise RuntimeError(
-                    f"Filtered neighbor query returned {len(approximate_rows)} rows; "
-                    f"exact search returned {len(exact_rows)}. "
-                    "Inspect neighbors-explain.txt and HNSW scan limits."
+            # The normal planner may use PostGIS + exact sorting, even with an
+            # HNSW index available. Run a separate diagnostic with index access
+            # strongly preferred so that HNSW filtering is actually exercised.
+            with conn.cursor() as cur:
+                cur.execute("SET enable_seqscan = off")
+                cur.execute("SET enable_bitmapscan = off")
+                cur.execute("SET enable_sort = off")
+            try:
+                forced, forced_rows, forced_plan = run_query(
+                    conn, "neighbors-hnsw", NEIGHBORS_SQL,
+                    (fingerprint, begin, end, fingerprint), args.iterations, args.output
                 )
+            finally:
+                with conn.cursor() as cur:
+                    cur.execute("RESET enable_sort")
+                    cur.execute("RESET enable_bitmapscan")
+                    cur.execute("RESET enable_seqscan")
+            if "fleet_signature_hnsw_idx" not in forced_plan:
+                raise RuntimeError("Forced HNSW query did not use the vector index")
 
-            hotspots, _ = run_query(
+            # truck_id + timestamp uniquely identifies a generated sample.
+            exact_ids = {(r[0], r[1]) for r in exact_rows}
+            for name, outcome, rows in (
+                ("neighbors", neighbors, approximate_rows),
+                ("neighbors_hnsw", forced, forced_rows),
+            ):
+                matched_ids = {(r[0], r[1]) for r in rows}
+                outcome["recall_at_20"] = round(
+                    len(matched_ids & exact_ids) / len(exact_ids) if exact_ids else 1.0,
+                    4,
+                )
+                outcome["expected_rows"] = len(exact_rows)
+                if len(rows) != len(exact_rows):
+                    raise RuntimeError(
+                        f"{name} returned {len(rows)} rows; exact search returned "
+                        f"{len(exact_rows)}. Inspect query plans and HNSW scan limits."
+                    )
+
+            neighbors["hnsw_index_used"] = "fleet_signature_hnsw_idx" in neighbors_plan
+            forced["hnsw_index_used"] = True
+
+            hotspots, _, _ = run_query(
                 conn, "hotspots", HOTSPOTS_SQL,
                 (fingerprint, begin, end), args.iterations, args.output
             )
             queries = {
                 "neighbors": neighbors,
+                "neighbors_hnsw": forced,
                 "neighbors_exact": exact,
                 "hotspots": hotspots,
             }
@@ -246,12 +275,15 @@ def main():
             f"| {name} result rows | {outcome['rows_returned']} |",
         ]
     summary += [
+        f"| neighbors normal-plan HNSW used | {neighbors['hnsw_index_used']} |",
         f"| neighbors recall@20 vs exact | {neighbors['recall_at_20']:.1%} |",
+        f"| forced HNSW recall@20 vs exact | {forced['recall_at_20']:.1%} |",
         f"| neighbors expected rows | {neighbors['expected_rows']} |",
         "",
         "COPY measures loading a pre-generated CSV. Queries run sequentially, not concurrently with ingestion. "
         "HNSW is approximate; the exact baseline uses a materialized, filtered candidate set. "
-        "Check EXPLAIN plans to see whether PostgreSQL actually chose the HNSW index."
+        "The forced-HNSW diagnostic disables sequential, bitmap and sort plan nodes; "
+        "its latency is not directly comparable to normal planner behavior."
     ]
     content = "\n".join(summary) + "\n"
     (args.output / "summary.md").write_text(content)
