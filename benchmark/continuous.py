@@ -235,6 +235,7 @@ def run_benchmark(args, dsn):
     return {
         "config": {
             "duration_s": args.duration, "ingest_target_rows_s": args.ingest_rate,
+            "search_strategy": strategy,
             "batch_size": args.batch_size, "query_workers": args.query_workers,
             "query_interval_ms": args.query_interval_ms, "trucks": args.trucks,
             "seed": args.seed,
@@ -260,6 +261,7 @@ def summary_md(result):
     ingest = result["ingest"]
     lines = [
         f"## Continuous load ({config['query_workers']} query workers)", "",
+        f"**Search strategy:** {config.get('search_strategy', 'auto')}",
         f"**Target:** {config['ingest_target_rows_s']:,} rows/s for "
         f"{config['duration_s']}s, {config['query_workers']} query workers",
         "",
