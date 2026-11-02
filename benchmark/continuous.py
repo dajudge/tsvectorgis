@@ -15,7 +15,7 @@ from datetime import timedelta
 
 import psycopg
 
-from run import COPY_SQL, HOTSPOTS_SQL, MUNICH_LAT, MUNICH_LON, NEIGHBORS_SQL
+from run import COPY_SQL, EXACT_NEIGHBORS_SQL, HOTSPOTS_SQL, MUNICH_LAT, MUNICH_LON, NEIGHBORS_SQL
 
 
 def make_batch(first, count, rate, anchor, trucks, seed):
@@ -75,11 +75,11 @@ def run_benchmark(args, dsn):
     # A fixed window covers both the initial seed and rows arriving during this run.
     begin = anchor - timedelta(hours=2)
     end = anchor + timedelta(seconds=args.duration + 60)
+    strategy = getattr(args, "search_strategy", "auto")
+    neighbor_sql = EXACT_NEIGHBORS_SQL if strategy == "spatial" else NEIGHBORS_SQL
+    neighbor_params = (begin, end, fingerprint) if strategy == "spatial" else (fingerprint, begin, end, fingerprint)
     queries = {
-        "neighbors": (
-            NEIGHBORS_SQL,
-            (fingerprint, begin, end, fingerprint),
-        ),
+        "neighbors": (neighbor_sql, neighbor_params),
         "hotspots": (
             HOTSPOTS_SQL,
             (fingerprint, begin, end),
@@ -283,6 +283,7 @@ def main():
     parser.add_argument("--ingest-rate", type=int, default=500, help="Target COPY rows/second")
     parser.add_argument("--batch-size", type=int, default=100)
     parser.add_argument("--query-workers", type=int, default=2)
+    parser.add_argument("--search-strategy", choices=("auto", "spatial", "hnsw"), default="auto")
     parser.add_argument("--query-interval-ms", type=int, default=500)
     parser.add_argument("--statement-timeout-ms", type=int, default=10000)
     parser.add_argument("--trucks", type=int, default=1000)
