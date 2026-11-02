@@ -140,7 +140,8 @@ def run_benchmark(args, dsn):
                     cursor.execute("SET hnsw.iterative_scan = strict_order")
                     cursor.execute("SET hnsw.ef_search = 100")
                     cursor.execute("SET hnsw.max_scan_tuples = 100000")
-                    cursor.execute("SET statement_timeout = %s", (args.statement_timeout_ms,))
+                    cursor.execute("SELECT set_config('statement_timeout', %s, false)",
+                                   (str(args.statement_timeout_ms),))
                 ready.wait(timeout=45)
                 go.wait()
                 deadline = started[0] + args.duration
