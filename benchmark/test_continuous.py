@@ -37,6 +37,7 @@ class ContinuousBenchmarkTest(unittest.TestCase):
             },
             "ingest": {
                 "rows": 99, "rows_s": 99,
+                "copy_batch_count": 1, "avg_rows_per_batch": 99,
                 "target_achievement_pct": 99,
                 "copy_batches": {"p95_ms": 1.2},
             },
